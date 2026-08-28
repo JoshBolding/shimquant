@@ -1,0 +1,540 @@
+diff --git a/include/llama.h b/include/llama.h
+index 49a758db2..31e163899 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -441,6 +441,7 @@ extern "C" {
+         bool pure;                                                  // quantize all tensors to the default type
+         bool keep_split;                                            // quantize to the same number of shards
+         bool dry_run;                                               // calculate and show the final quantization size without performing quantization
++        bool pad_quant_force;                                       // force eligible weights to a 256-wide row multiple (PadQuant equivalence testing)
+         const struct llama_model_imatrix_data * imatrix;            // pointer to importance matrix data
+         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
+         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 8fca8e1bc..f43011dbe 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1489,6 +1489,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     samplers         (params.samplers),
+     cb_func          (params.cb),
+     res              (params.res),
++    pad_orig_ne0     (params.pad_orig_ne0),
+     ctx0             (res->get_ctx()),
+     gf               (res->get_gf()) {
+         res->set_params(params);
+@@ -1508,11 +1509,34 @@ ggml_tensor * llm_graph_context::build_cvec(
+     return cvec->apply_to(ctx0, cur, il);
+ }
+ 
++ggml_tensor * llm_graph_context::build_pad_quant_input(
++          ggml_tensor * w,
++          ggml_tensor * cur) const {
++    if (pad_orig_ne0 == nullptr) {
++        return cur;
++    }
++
++    const auto it = pad_orig_ne0->find(ggml_get_name(w));
++    if (it == pad_orig_ne0->end()) {
++        return cur;
++    }
++
++    const int64_t orig_ne0 = it->second;
++    GGML_ASSERT(orig_ne0 > 0 && orig_ne0 < w->ne[0]);
++    GGML_ASSERT(cur->ne[0] == orig_ne0 || cur->ne[0] == w->ne[0]);
++
++    if (cur->ne[0] == w->ne[0]) {
++        return cur;
++    }
++
++    return ggml_pad(ctx0, cur, (int) (w->ne[0] - orig_ne0), 0, 0, 0);
++}
++
+ ggml_tensor * llm_graph_context::build_lora_mm(
+           ggml_tensor * w,
+           ggml_tensor * cur,
+           ggml_tensor * w_s) const {
+-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
++    ggml_tensor * res = ggml_mul_mat(ctx0, w, build_pad_quant_input(w, cur));
+ 
+     if (w_s) {
+         res = ggml_mul(ctx0, res, w_s);
+@@ -1544,7 +1568,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+           ggml_tensor * cur, // ggml_tensor * b
+           ggml_tensor * ids,
+           ggml_tensor * w_s) const {
+-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
++    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, build_pad_quant_input(w, cur), ids);
+ 
+     if (w_s) {
+         const int64_t n_expert = w_s->ne[0];
+@@ -3594,13 +3618,13 @@ void llm_graph_context::build_dense_out(
+     GGML_ASSERT(cur != nullptr && "missing t_embd_pooled/t_embd");
+ 
+     if (dense_2) {
+-        cur = ggml_mul_mat(ctx0, dense_2, cur);
++        cur = ggml_mul_mat(ctx0, dense_2, build_pad_quant_input(dense_2, cur));
+     }
+     if (dense_2_b) {
+         cur = ggml_add(ctx0, cur, dense_2_b);
+     }
+     if (dense_3) {
+-        cur = ggml_mul_mat(ctx0, dense_3, cur);
++        cur = ggml_mul_mat(ctx0, dense_3, build_pad_quant_input(dense_3, cur));
+     }
+     cb(cur, "result_embd_pooled", -1);
+     res->t_embd_pooled = cur;
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index b388e028c..b299a6660 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -11,6 +11,7 @@
+ #include <set>
+ #include <functional>
+ #include <map>
++#include <unordered_map>
+ 
+ struct ggml_cgraph;
+ struct ggml_context;
+@@ -809,6 +810,8 @@ struct llm_graph_params {
+ 
+     llm_graph_result * res;
+ 
++    const std::unordered_map<std::string, int64_t> * pad_orig_ne0 = nullptr;
++
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+     bool allow_reuse(const llm_graph_params & other) const {
+@@ -1032,6 +1035,8 @@ struct llm_graph_context {
+ 
+     llm_graph_result * res;
+ 
++    const std::unordered_map<std::string, int64_t> * pad_orig_ne0;
++
+     ggml_context * ctx0 = nullptr;
+     ggml_cgraph  * gf   = nullptr;
+ 
+@@ -1048,6 +1053,10 @@ struct llm_graph_context {
+              ggml_tensor * cur,
+                      int   il) const;
+ 
++    ggml_tensor * build_pad_quant_input(
++              ggml_tensor * w,
++              ggml_tensor * cur) const;
++
+     // do mat_mul, while optionally apply lora and per-tensor scale
+     ggml_tensor * build_lora_mm(
+               ggml_tensor * w,
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index d9241022c..080ca4aeb 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -886,7 +886,34 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(
+ 
+     bool is_ok = true;
+ 
+-    if (allow_reshape) {
++    static constexpr const char * pad_prefix = "lattice.pad.orig_ne0.";
++    const std::string pad_key = std::string(pad_prefix) + name;
++    const int64_t pad_key_id = gguf_find_key(metadata, pad_key.c_str());
++    const int64_t pad_orig_ne0 = pad_key_id >= 0 && gguf_get_kv_type(metadata, pad_key_id) == GGUF_TYPE_INT64
++        ? gguf_get_val_i64(metadata, pad_key_id) : 0;
++
++    if (pad_orig_ne0 > 0) {
++        if (ne.empty() || ne[0] != pad_orig_ne0 || cur->ne[0] <= pad_orig_ne0 || cur->ne[0] % 256 != 0) {
++            is_ok = false;
++        } else if (allow_reshape) {
++            int64_t actual_orig_elements = pad_orig_ne0;
++            for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
++                actual_orig_elements *= cur->ne[i];
++            }
++            int64_t expected_elements = 1;
++            for (const int64_t dim : ne) {
++                expected_elements *= dim;
++            }
++            is_ok = actual_orig_elements == expected_elements;
++        } else {
++            for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
++                if ((i < ne.size() && ne[i] != cur->ne[i]) || (i >= ne.size() && cur->ne[i] != 1)) {
++                    is_ok = false;
++                    break;
++                }
++            }
++        }
++    } else if (allow_reshape) {
+         // check total number of elements only
+         const int64_t ncur = ggml_nelements(cur);
+         int64_t nexp = 1;
+@@ -1300,7 +1327,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     }
+ 
+     ggml_tensor t_meta = *cur;
+-    if (flags & TENSOR_ALLOW_RESHAPE) {
++    static constexpr const char * pad_prefix = "lattice.pad.orig_ne0.";
++    const std::string pad_key = std::string(pad_prefix) + tn.str();
++    const int64_t pad_key_id = gguf_find_key(metadata, pad_key.c_str());
++    const bool is_pad_quant = pad_key_id >= 0 && gguf_get_kv_type(metadata, pad_key_id) == GGUF_TYPE_INT64;
++    if ((flags & TENSOR_ALLOW_RESHAPE) && !is_pad_quant) {
+         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+             t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+             if (dim == 0) {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index fc83658dd..1efed30f5 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1195,6 +1195,8 @@ void llama_model_base::load_stats(llama_model_loader & ml) {
+ 
+ void llama_model_base::load_hparams(llama_model_loader & ml) {
+     const gguf_context * ctx = ml.metadata;
++    static constexpr const char * pad_prefix = "lattice.pad.orig_ne0.";
++    const size_t pad_prefix_len = std::strlen(pad_prefix);
+ 
+     // get metadata as string
+     for (int i = 0; i < gguf_get_n_kv(ctx); i++) {
+@@ -1205,6 +1207,14 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+         const char * name = gguf_get_key(ctx, i);
+         const std::string value = gguf_kv_to_str(ctx, i);
+         gguf_kv.emplace(name, value);
++
++        if (std::strncmp(name, pad_prefix, pad_prefix_len) == 0 && type == GGUF_TYPE_INT64) {
++            const int64_t orig_ne0 = gguf_get_val_i64(ctx, i);
++            if (orig_ne0 <= 0) {
++                throw std::runtime_error(format("invalid PadQuant width for tensor %s", name + pad_prefix_len));
++            }
++            pad_orig_ne0.emplace(name + pad_prefix_len, orig_ne0);
++        }
+     }
+ 
+     // get general kv
+@@ -2650,7 +2660,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+ }
+ 
+ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+-    std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
++    llm_graph_params pad_params = params;
++    pad_params.pad_orig_ne0 = &pad_orig_ne0;
++    std::unique_ptr<llm_graph_context> llm = build_arch_graph(pad_params);
+ 
+     // add on pooling layer
+     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 0d7352ac5..1c39151b8 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -694,6 +694,9 @@ struct llama_model {
+     // gguf metadata
+     std::unordered_map<std::string, std::string> gguf_kv;
+ 
++    // PadQuant tensors keyed by GGUF tensor name; value is the unpadded activation width.
++    std::unordered_map<std::string, int64_t> pad_orig_ne0;
++
+     // list of devices used in this model
+     std::vector<llama_device> devices;
+ 
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index c414caa17..32d90f5e3 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -207,8 +207,57 @@ struct tensor_metadata {
+     std::string     remapped_imatrix_name;
+     bool            allows_quantization;
+     bool            requires_imatrix;
++    bool            pad_quant_eligible;
++    int64_t         pad_orig_ne0;
++    int64_t         pad_ne0;
+ };
+ 
++static bool tensor_allows_pad_quant(const tensor_metadata & tm) {
++    const std::string & name = tm.name;
++
++    // V1 is matrix multiplication only. In particular, never widen embedding or lookup tables.
++    if (tm.category == tensor_category::TOKEN_EMBD ||
++        name.find("token_embd")           != std::string::npos ||
++        name.find("embed_tokens")         != std::string::npos ||
++        name.find("compressor_ape")       != std::string::npos ||
++        name.find("ffn_gate_tid2eid")     != std::string::npos ||
++        name.find("attn_rel_b")           != std::string::npos ||
++        name.find("markov_w1")            != std::string::npos ||
++        name.find("selector_predecessor") != std::string::npos ||
++        name.find("selector_successor")   != std::string::npos ||
++        name.find("d2t")                  != std::string::npos ||
++        name.find("conv")                 != std::string::npos) {
++        return false;
++    }
++
++    if (tm.category != tensor_category::OTHER) {
++        return true;
++    }
++
++    // Additional projection families used by hybrid/MoE architectures, including Qwen Flash-Next.
++    const bool projection_name =
++        name.find("attn_")           != std::string::npos ||
++        name.find("ffn_")            != std::string::npos ||
++        name.find("hc_")             != std::string::npos ||
++        name.find("ssm_")            != std::string::npos ||
++        name.find("ple_key")          != std::string::npos ||
++        name.find("ple_value")        != std::string::npos ||
++        name.find("nextn.eh_proj")    != std::string::npos ||
++        name.find("shared_head_head") != std::string::npos ||
++        name.find("model_proj")       != std::string::npos ||
++        name.find("dense_")           != std::string::npos ||
++        name == "output.weight";
++
++    const bool elementwise_name =
++        name.find("norm")  != std::string::npos ||
++        name.find("base")  != std::string::npos ||
++        name.find("scale") != std::string::npos ||
++        name.find("sinks") != std::string::npos ||
++        name.find("probs") != std::string::npos;
++
++    return projection_name && !elementwise_name;
++}
++
+ //
+ // dequantization
+ //
+@@ -680,7 +729,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+ }
+ 
+ // outer wrapper: determine the ggml_type that this tensor should be quantized to
+-static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
++static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm, bool allow_padding) {
+     if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
+         return tensor->type;
+     }
+@@ -731,8 +780,11 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
+             new_type = llama_tensor_get_type_impl(qs, new_type, tensor, params->ftype, tm.category);
+         }
+ 
+-        // incompatible tensor shapes are handled here - fallback to a compatible type
+-        new_type = tensor_type_fallback(qs, tensor, new_type);
++        // PadQuant handles eligible 256-block rows before quantization; all other shapes keep the stock fallback.
++        const bool pad_instead = allow_padding && tensor->ne[0] % 256 != 0 && ggml_blck_size(new_type) == 256;
++        if (!pad_instead) {
++            new_type = tensor_type_fallback(qs, tensor, new_type);
++        }
+     }
+ 
+     return new_type;
+@@ -1063,16 +1115,42 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+         if (!ctx_outs[i_split]) {
+             ctx_outs[i_split].reset(gguf_init_empty());
+         }
+-        gguf_add_tensor(ctx_outs[i_split].get(), tensor);
+ 
+         metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
++        metadata[i].pad_quant_eligible = metadata[i].allows_quantization && tensor_allows_pad_quant(metadata[i]);
++        metadata[i].pad_orig_ne0 = 0;
++        metadata[i].pad_ne0 = tensor->ne[0];
+ 
+         if (metadata[i].allows_quantization) {
+-            metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
++            metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i], metadata[i].pad_quant_eligible);
+         } else {
+             metadata[i].target_type = tensor->type;
+         }
+ 
++        const bool needs_256 = ggml_blck_size(metadata[i].target_type) == 256;
++        if (metadata[i].pad_quant_eligible && tensor->ne[0] % 256 != 0 && (needs_256 || params->pad_quant_force)) {
++            metadata[i].pad_orig_ne0 = tensor->ne[0];
++            metadata[i].pad_ne0 = GGML_PAD(tensor->ne[0], 256);
++        }
++
++        if (metadata[i].pad_orig_ne0 > 0) {
++            ggml_tensor padded_meta = *tensor;
++            padded_meta.ne[0] = metadata[i].pad_ne0;
++            padded_meta.nb[0] = ggml_type_size(padded_meta.type);
++            padded_meta.nb[1] = ggml_row_size(padded_meta.type, padded_meta.ne[0]);
++            for (size_t dim = 2; dim < GGML_MAX_DIMS; ++dim) {
++                padded_meta.nb[dim] = padded_meta.nb[dim - 1] * padded_meta.ne[dim - 1];
++            }
++            gguf_add_tensor(ctx_outs[i_split].get(), &padded_meta);
++
++            const std::string pad_key = "lattice.pad.orig_ne0." + metadata[i].name;
++            gguf_set_val_i64(ctx_outs[i_split].get(), pad_key.c_str(), metadata[i].pad_orig_ne0);
++            LLAMA_LOG_INFO("%s: PadQuant will widen %s from %" PRId64 " to %" PRId64 " columns\n",
++                           __func__, metadata[i].name.c_str(), metadata[i].pad_orig_ne0, metadata[i].pad_ne0);
++        } else {
++            gguf_add_tensor(ctx_outs[i_split].get(), tensor);
++        }
++
+         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
+ 
+         if (params->imatrix) {
+@@ -1110,6 +1188,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+     std::vector<no_init<uint8_t>> read_data;
+     std::vector<no_init<uint8_t>> work;
+     std::vector<no_init<float>> f32_conv_buf;
++    std::vector<no_init<float>> f32_pad_buf;
+ 
+     const size_t max_buf_size = params->max_buf_size ? params->max_buf_size : LLAMA_QUANT_MAX_BUF_SIZE;
+ 
+@@ -1182,14 +1261,14 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+ 
+         // If we've decided to quantize to the same type the tensor is already
+         // in then there's nothing to do.
+-        bool quantize = cur_type != new_type;
++        bool quantize = cur_type != new_type || tm.pad_orig_ne0 > 0;
+ 
+         size_t new_size;
+ 
+         if (params->dry_run) {
+             // the --dry-run option calculates the final quantization size without quantizing
+             if (quantize) {
+-                new_size = ggml_nrows(tensor) * ggml_row_size(new_type, tensor->ne[0]);
++                new_size = ggml_nrows(tensor) * ggml_row_size(new_type, tm.pad_ne0);
+                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB (%s)\n",
+                                tensor_size/1024.0/1024.0,
+                                new_size/1024.0/1024.0,
+@@ -1220,6 +1299,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+                 }
+             } else {
+                 const float * imatrix = nullptr;
++                std::vector<float> padded_imatrix;
+                 if (imatrix_data) {
+                     auto it = imatrix_data->find(tm.remapped_imatrix_name);
+                     if (it == imatrix_data->end()) {
+@@ -1227,6 +1307,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+                     } else {
+                         if (it->second.size() == (size_t)tensor->ne[0]*tensor->ne[2]) {
+                             imatrix = it->second.data();
++                            if (tm.pad_orig_ne0 > 0) {
++                                padded_imatrix.assign((size_t) tm.pad_ne0 * tensor->ne[2], 0.0f);
++                                for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
++                                    std::memcpy(padded_imatrix.data() + i03 * tm.pad_ne0,
++                                                it->second.data() + i03 * tm.pad_orig_ne0,
++                                                (size_t) tm.pad_orig_ne0 * sizeof(float));
++                                }
++                                imatrix = padded_imatrix.data();
++                            }
+                         } else {
+                             LLAMA_LOG_INFO("\n====== %s: imatrix size %d is different from tensor size %d for %s\n", __func__,
+                                     int(it->second.size()), int(tensor->ne[0]*tensor->ne[2]), tensor->name);
+@@ -1257,14 +1346,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+                 LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
+                 fflush(stdout);
+ 
+-                const int64_t n_per_row = tensor->ne[0];
++                const int64_t src_n_per_row = tensor->ne[0];
++                const int64_t n_per_row = tm.pad_ne0;
+                 const int64_t nrows = tensor->ne[1];
+ 
+-                const size_t row_size_src = ggml_row_size(tensor->type, n_per_row);
++                const size_t row_size_src = ggml_row_size(tensor->type, src_n_per_row);
+                 const size_t row_size_dst = ggml_row_size(new_type,     n_per_row);
+ 
+                 // process the rows in slabs, so that the buffers stay below max_buf_size
+-                const size_t bytes_per_row = row_size_src + row_size_dst + (tensor->type == GGML_TYPE_F32 ? 0 : n_per_row*sizeof(float));
++                const size_t bytes_per_row = row_size_src + row_size_dst + n_per_row*sizeof(float);
+                 const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows, max_buf_size/bytes_per_row));
+ 
+                 static const int64_t min_chunk_size = 32 * 512;
+@@ -1277,6 +1367,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+ 
+                     for (int64_t ir = 0; ir < nrows; ir += nrows_slab) {
+                         const int64_t nrows_cur = std::min(nrows_slab, nrows - ir);
++                        const int64_t src_nelements_cur = nrows_cur * src_n_per_row;
+                         const int64_t nelements_cur = nrows_cur * n_per_row;
+ 
+                         const void * src = load_range((i03*nrows + ir)*row_size_src, nrows_cur*row_size_src);
+@@ -1285,13 +1376,26 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+                         if (tensor->type == GGML_TYPE_F32) {
+                             f32_data = (const float *) src;
+                         } else {
+-                            if (f32_conv_buf.size() < (size_t) nelements_cur) {
+-                                f32_conv_buf.resize(nelements_cur);
++                            if (f32_conv_buf.size() < (size_t) src_nelements_cur) {
++                                f32_conv_buf.resize(src_nelements_cur);
+                             }
+-                            llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
++                            llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, src_nelements_cur, nthread);
+                             f32_data = (const float *) f32_conv_buf.data();
+                         }
+ 
++                        if (tm.pad_orig_ne0 > 0) {
++                            if (f32_pad_buf.size() < (size_t) nelements_cur) {
++                                f32_pad_buf.resize(nelements_cur);
++                            }
++                            std::fill_n((float *) f32_pad_buf.data(), nelements_cur, 0.0f);
++                            for (int64_t row = 0; row < nrows_cur; ++row) {
++                                std::memcpy((float *) f32_pad_buf.data() + row * n_per_row,
++                                            f32_data + row * src_n_per_row,
++                                            (size_t) src_n_per_row * sizeof(float));
++                            }
++                            f32_data = (const float *) f32_pad_buf.data();
++                        }
++
+                         if (work.size() < nrows_cur*row_size_dst) {
+                             work.resize(nrows_cur*row_size_dst);
+                         }
+@@ -1358,6 +1462,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
+         /*.pure                        =*/ false,
+         /*.keep_split                  =*/ false,
+         /*.dry_run                     =*/ false,
++        /*.pad_quant_force             =*/ false,
+         /*.imatrix                     =*/ nullptr,
+         /*.kv_overrides                =*/ nullptr,
+         /*.tensor_type                 =*/ nullptr,
+@@ -1465,6 +1570,6 @@ void llama_quant_compute_types(
+ 
+     // compute types
+     for (size_t i = 0; i < n_tensors; i++) {
+-        result_types[i] = llama_tensor_get_type(*qs, &local_params, tensors[i], default_type, metadata[i]);
++        result_types[i] = llama_tensor_get_type(*qs, &local_params, tensors[i], default_type, metadata[i], false);
+     }
+ }
+diff --git a/src/models/nemotron-h.cpp b/src/models/nemotron-h.cpp
+index f02674c64..e9d26132c 100644
+--- a/src/models/nemotron-h.cpp
++++ b/src/models/nemotron-h.cpp
+@@ -271,7 +271,8 @@ ggml_tensor * llama_model_nemotron_h::graph::build_ffn_layer(ggml_tensor * cur,
+         ggml_tensor * inp_latent = cur;
+ 
+         if (model.layers[il].ffn_latent_down) {
+-            inp_latent = ggml_mul_mat(ctx0, model.layers[il].ffn_latent_down, cur);
++            inp_latent = ggml_mul_mat(ctx0, model.layers[il].ffn_latent_down,
++                    build_pad_quant_input(model.layers[il].ffn_latent_down, cur));
+         }
+ 
+         ggml_tensor * router_logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
+@@ -296,7 +297,8 @@ ggml_tensor * llama_model_nemotron_h::graph::build_ffn_layer(ggml_tensor * cur,
+         cb(moe_out, "ffn_moe_out", il);
+ 
+         if (model.layers[il].ffn_latent_up) {
+-            moe_out = ggml_mul_mat(ctx0, model.layers[il].ffn_latent_up, moe_out);
++            moe_out = ggml_mul_mat(ctx0, model.layers[il].ffn_latent_up,
++                    build_pad_quant_input(model.layers[il].ffn_latent_up, moe_out));
+         }
+ 
+         ggml_tensor * ffn_shexp = build_ffn(inp_emb,
+diff --git a/tools/quantize/quantize.cpp b/tools/quantize/quantize.cpp
+index 38950036c..87cabad48 100644
+--- a/tools/quantize/quantize.cpp
++++ b/tools/quantize/quantize.cpp
+@@ -122,7 +122,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
+ static void usage(const char * executable) {
+     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
+     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
+-    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
++    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--pad-quant-force] [--max-buffer-size]\n");
+     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
+     printf("  --allow-requantize\n");
+     printf("                                      allow requantizing tensors that have already been quantized\n");
+@@ -162,6 +162,9 @@ static void usage(const char * executable) {
+     printf("  --dry-run\n");
+     printf("                                      calculate and show the final quantization size without performing quantization\n");
+     printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n");
++    printf("  --pad-quant-force\n");
++    printf("                                      force PadQuant's 256-column padding for eligible matrix weights\n");
++    printf("                                      intended for Q8_0 equivalence testing; 256-block types pad automatically\n");
+     printf("  --max-buffer-size MiB\n");
+     printf("                                      max amount of tensor rows kept in memory while quantizing one tensor (default: 8192)\n");
+     printf("                                      lower it to quantize models with very large tensors on a machine with little RAM\n\n");
+@@ -446,6 +449,8 @@ int llama_quantize(int argc, char ** argv) {
+             }
+         } else if (strcmp(argv[arg_idx], "--dry-run") == 0) {
+             params.dry_run = true;
++        } else if (strcmp(argv[arg_idx], "--pad-quant-force") == 0) {
++            params.pad_quant_force = true;
+         } else if (strcmp(argv[arg_idx], "--allow-requantize") == 0) {
+             params.allow_requantize = true;
+         } else if (strcmp(argv[arg_idx], "--pure") == 0) {
