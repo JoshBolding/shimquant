@@ -121,6 +121,11 @@ cmake -B build -DGGML_CUDA=ON
 cmake --build build -j
 ```
 
+The base commit is pinned because **every number in this README was measured on a build of
+it**. As of 2026-08-28 the patch also applies cleanly to upstream `master`
+(`50f068fff`), verified with `git apply --check`, so you can skip the `git checkout` if you
+prefer to be current — but then you are running a build I have not measured.
+
 Then quantize as usual. Padding engages automatically whenever a target type needs 256-blocks
 and the tensor width doesn't provide it; the log prints
 `PadQuant will widen <tensor> from N to M columns` for each one.
