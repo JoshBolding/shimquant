@@ -12,7 +12,7 @@ This is a research prototype. Read the [limitations](#limitations) before you ge
 one of them is a model where the technique loses.
 
 **Want the file rather than the patch?** The tuned build described below is published at
-[boldingj10/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ShimQuant-GGUF](https://huggingface.co/boldingj10/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ShimQuant-GGUF).
+[BoldingBuilds/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ShimQuant-GGUF](https://huggingface.co/BoldingBuilds/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-ShimQuant-GGUF).
 You still need this patch to load it.
 
 ## The problem
