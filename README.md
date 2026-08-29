@@ -66,13 +66,38 @@ per-token KL divergence in nats, lower is closer to Q8.
 | **shimmed IQ2_M** | **3.13** | **12.01 GiB** | 0.5229 |
 | **shimmed, tuned recipe** | **3.07** | **11.77 GiB** | **0.1230** |
 
-The third row is the headline: **24% smaller than stock IQ2_M and less damaged**, which is a
-strict improvement rather than a trade. Note that stock IQ3_XXS and stock IQ2_M are the same
-4.70 bpw file size apart from rounding — that is the floor, visible.
+The last row is the headline: **24% smaller than stock IQ2_M and less damaged**. That is a
+strict improvement over *that rung*. It is not a claim about the whole ladder — stock IQ3_XXS
+is at 0.0398, three times closer to Q8 than the tuned build, at 6.2 GiB more. The narrow claim
+is the defensible one: below about 18 GiB the stock quantizer produces nothing at all for this
+model, and this is a usable file in that gap.
 
-The tuned recipe (Q6_K base, experts crushed, everything else protected) scored **94.0%
-pass@1 on HumanEval** (47/50, greedy, executed tests) on a single 16 GB RTX 5080, a card the
-stock file does not fit on at any label.
+Read the middle two rows honestly as well. A plain shimmed IQ2_M is **worse** than stock
+IQ2_M (0.5229 against 0.2722). Padding on its own does not buy quality; it buys access to the
+low-bit types, and what you do with that access is the recipe's job.
+
+The tuned recipe (Q6_K base, experts crushed, everything else protected) scored **91.5% pass@1
+on HumanEval** (164 problems, greedy, executed tests, 6000-token cap) on an RTX 3090, and
+**91.5%** again on a 16 GB RTX 5080, a card the stock file does not fit on at any label. An
+earlier 50-problem run on the 5080 read 94.0%; the full 164-problem figure supersedes it.
+
+### Speed: padded builds are slower, and by how much on GPU is still being measured
+
+This is the cost and it belongs above the fold. On CPU, on the real model with wikitext-2:
+
+| build | PPL | seconds/pass |
+|---|---:|---:|
+| stock fallback IQ4_NL | 7.2237 ± 0.15721 | 87.27 |
+| shimmed IQ2_M | 8.3139 ± 0.18168 | **196.11** |
+
+**2.25× slower per pass, and 15% worse perplexity.** Both figures are for the plain shimmed
+IQ2_M, the row that is already the weakest in the table above, not the tuned recipe. Two
+effects are bundled into the slowdown: the padded model carries more weights to multiply, and
+the graph runs `ggml_pad` on activations at every padded matmul.
+
+A like-for-like GPU measurement (same model, same quant type, `--pure` on both sides, one
+padded and one not) is running and will be added here. Until it is, the only inference-speed
+number this project owns is the CPU one above, and it is a regression.
 
 ```bash
 llama-quantize --imatrix nemotron.imatrix \
@@ -84,6 +109,46 @@ llama-quantize --imatrix nemotron.imatrix \
 
 (`blk.52` is the MTP block: decode-only, so it gets no imatrix data, and `llama-quantize`
 refuses to put a low-bit type on a tensor with no importance statistics. Pin it.)
+
+## Does padding change the math?
+
+No, and this is the part a reviewer should push on hardest, so here is the evidence rather
+than an assurance.
+
+**Bit-identical output.** A toy MoE fixture quantized to Q8_0 twice, once normally and once
+with `--pad-quant-force` widening `ffn_gate_exps` and `ffn_up_exps` from 64 to 256 and
+`ffn_down_exps` from 320 to 512, produced the same output hash both times:
+
+```text
+50b8e953efa0f64d6565774793d10b1e5eed69972e272685315273145afefd1d
+```
+
+That is a strong result and a narrow one. `--pad-quant-force` only applies to Q8_0, whose
+blocks are 32 elements, and 320 and 64 are both multiples of 32. Padding there appends whole
+untouched zero blocks, so bit-equality is close to algebraically guaranteed. It confirms the
+implementation does what it says; it cannot speak to k-quants.
+
+**The k-quant boundary superblock, which is the case that actually matters.** Nemotron's
+expert width is 1856 = 7×256 + 64. Padded to 2048 that is eight k-quant superblocks, and the
+eighth holds 64 real weights beside 192 injected zeros, sharing one scale and minimum with
+them. If padding degrades anything, it degrades those 64 weights.
+
+Measured by dequantizing the shipped tuned build and comparing against the BF16 parent,
+reconstruction error per superblock, `iq2_s`, ~11M real weights:
+
+| | RMSE | normalised |
+|---|---:|---:|
+| interior superblocks 0–6 (all real) | 6.709e-03 | 0.3765 |
+| boundary superblock 7 (64 real + 192 zeros) | 6.550e-03 | 0.3674 |
+
+Ratio 0.976, and 0.981 on a second tensor from a different layer. The boundary superblock is
+quantized **no worse** than a fully-real one, well inside the spread of the interior blocks
+themselves. This measures the file that actually shipped, not a synthetic fixture.
+
+One precision worth stating: after dequantization the padded columns are not exactly zero
+(max 1.8e-3 against a weight RMS of 1.8e-2). That is harmless because `ggml_pad` zeroes the
+*activation* entering those columns, so they multiply by zero. The correctness rests on the
+activation side, not on the weights staying pristine.
 
 ## Limitations
 
