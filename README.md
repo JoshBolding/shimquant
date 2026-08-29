@@ -83,21 +83,34 @@ earlier 50-problem run on the 5080 read 94.0%; the full 164-problem figure super
 
 ### Speed: padded builds are slower, and by how much on GPU is still being measured
 
-This is the cost and it belongs above the fold. On CPU, on the real model with wikitext-2:
+### On GPU: about 7%
 
-| build | PPL | seconds/pass |
-|---|---:|---:|
-| stock fallback IQ4_NL | 7.2237 ± 0.15721 | 87.27 |
-| shimmed IQ2_M | 8.3139 ± 0.18168 | **196.11** |
+Isolated properly — same model, same quant type, same build, `--pure` on both sides so
+`llama-quantize`'s internal type overrides cannot promote a tensor on one side only. The only
+difference between these two files is the padding. Nemotron-3-Nano, Q4_0, RTX 3090,
+`llama-bench`, 5 reps:
 
-**2.25× slower per pass, and 15% worse perplexity.** Both figures are for the plain shimmed
-IQ2_M, the row that is already the weakest in the table above, not the tuned recipe. Two
-effects are bundled into the slowdown: the padded model carries more weights to multiply, and
-the graph runs `ggml_pad` on activations at every padded matmul.
+| | plain | padded | cost |
+|---|---:|---:|---:|
+| size | 16.57 GiB | 17.77 GiB | +7.2% |
+| parameters | 31.58 B | 33.87 B | +7.2% |
+| prefill, pp512 | 3869.6 ± 156.3 t/s | 3753.7 ± 146.4 t/s | −3.0% |
+| generation, tg128 | 233.7 ± 1.0 t/s | 217.8 ± 0.7 t/s | **−6.8%** |
 
-A like-for-like GPU measurement (same model, same quant type, `--pure` on both sides, one
-padded and one not) is running and will be added here. Until it is, the only inference-speed
-number this project owns is the CPU one above, and it is a regression.
+Generation is clearly outside the error bars. Prefill's intervals overlap, so treat −3% as
+not established. Two effects are bundled in: the padded model genuinely carries more
+parameters, and the graph runs `ggml_pad` on activations at each padded matmul.
+
+**On a model with 256-divisible widths nothing pads, so the path never engages and the cost
+is zero.** This is a tax on affected models only.
+
+### On CPU there is a much larger number, and it is measuring something else
+
+`PADQUANT_V1.md` records stock IQ4_NL at 87.27 s/pass against shimmed IQ2_M at 196.11, with
+15% worse perplexity. That comparison changes the quant type *and* the padding at the same
+time, so it does not isolate padding and should not be read as its cost. It is reported here
+because it exists in the evidence pack and a reader will find it; the GPU table above is the
+like-for-like measurement.
 
 ```bash
 llama-quantize --imatrix nemotron.imatrix \
