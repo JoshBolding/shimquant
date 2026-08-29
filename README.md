@@ -34,19 +34,19 @@ quantizer just can't address them.
 
 ## What the patch does
 
-**At quantize time** (`src/llama-quant.cpp`): a tensor eligible for padding whose target type
+**At quantize time** (`src/llama-quant.cpp`): a tensor eligible for shimming whose target type
 needs 256-blocks gets `ne[0]` rounded up to the next multiple of 256, with the added columns
 zeroed. The original width is written to GGUF metadata as `lattice.pad.orig_ne0.<tensor>`.
-For 3D expert banks every expert is padded independently.
+For 3D expert banks every expert is shimmed independently.
 
 **At load time** (`src/llama-model-loader.cpp`, `src/llama-model.cpp`): the metadata is read
-back so the model knows each padded tensor's true width.
+back so the model knows each shimmed tensor's true width.
 
-**At inference** (`src/llama-graph.cpp`): activations entering a padded matmul are padded to
+**At inference** (`src/llama-graph.cpp`): activations entering a shimmed matmul are shimmed to
 match, and the result is sliced back to the original width, so the graph is numerically
-equivalent to the unpadded model apart from quantization error.
+equivalent to the unshimmed model apart from quantization error.
 
-Padding is automatic for 256-block target types. `--pad-quant-force` widens eligible tensors
+Shimming is automatic for 256-block target types. `--pad-quant-force` widens eligible tensors
 even when the target type doesn't require it, which is only useful for experiments.
 
 540 lines across nine files, on top of upstream
@@ -73,7 +73,7 @@ is the defensible one: below about 18 GiB the stock quantizer produces nothing a
 model, and this is a usable file in that gap.
 
 Read the middle two rows honestly as well. A plain shimmed IQ2_M is **worse** than stock
-IQ2_M (0.5229 against 0.2722). Padding on its own does not buy quality; it buys access to the
+IQ2_M (0.5229 against 0.2722). Shimming on its own does not buy quality; it buys access to the
 low-bit types, and what you do with that access is the recipe's job.
 
 The tuned recipe (Q6_K base, experts crushed, everything else protected) scored **91.5% pass@1
@@ -81,16 +81,16 @@ on HumanEval** (164 problems, greedy, executed tests, 6000-token cap) on an RTX 
 **91.5%** again on a 16 GB RTX 5080, a card the stock file does not fit on at any label. An
 earlier 50-problem run on the 5080 read 94.0%; the full 164-problem figure supersedes it.
 
-### Speed: padded builds are slower, and by how much on GPU is still being measured
+### Speed: shimmed builds are slower, and by how much on GPU is still being measured
 
 ### On GPU: about 7%
 
 Isolated properly — same model, same quant type, same build, `--pure` on both sides so
 `llama-quantize`'s internal type overrides cannot promote a tensor on one side only. The only
-difference between these two files is the padding. Nemotron-3-Nano, Q4_0, RTX 3090,
+difference between these two files is the shimming. Nemotron-3-Nano, Q4_0, RTX 3090,
 `llama-bench`, 5 reps:
 
-| | plain | padded | cost |
+| | plain | shimmed | cost |
 |---|---:|---:|---:|
 | size | 16.57 GiB | 17.77 GiB | +7.2% |
 | parameters | 31.58 B | 33.87 B | +7.2% |
@@ -98,17 +98,17 @@ difference between these two files is the padding. Nemotron-3-Nano, Q4_0, RTX 30
 | generation, tg128 | 233.7 ± 1.0 t/s | 217.8 ± 0.7 t/s | **−6.8%** |
 
 Generation is clearly outside the error bars. Prefill's intervals overlap, so treat −3% as
-not established. Two effects are bundled in: the padded model genuinely carries more
-parameters, and the graph runs `ggml_pad` on activations at each padded matmul.
+not established. Two effects are bundled in: the shimmed model genuinely carries more
+parameters, and the graph runs `ggml_pad` on activations at each shimmed matmul.
 
-**On a model with 256-divisible widths nothing pads, so the path never engages and the cost
+**On a model with 256-divisible widths nothing shims, so the path never engages and the cost
 is zero.** This is a tax on affected models only.
 
 ### On CPU there is a much larger number, and it is measuring something else
 
 `PADQUANT_V1.md` records stock IQ4_NL at 87.27 s/pass against shimmed IQ2_M at 196.11, with
-15% worse perplexity. That comparison changes the quant type *and* the padding at the same
-time, so it does not isolate padding and should not be read as its cost. It is reported here
+15% worse perplexity. That comparison changes the quant type *and* the shimming at the same
+time, so it does not isolate shimming and should not be read as its cost. It is reported here
 because it exists in the evidence pack and a reader will find it; the GPU table above is the
 like-for-like measurement.
 
@@ -123,7 +123,7 @@ llama-quantize --imatrix nemotron.imatrix \
 (`blk.52` is the MTP block: decode-only, so it gets no imatrix data, and `llama-quantize`
 refuses to put a low-bit type on a tensor with no importance statistics. Pin it.)
 
-## Does padding change the math?
+## Does shimming change the math?
 
 No, and this is the part a reviewer should push on hardest, so here is the evidence rather
 than an assurance.
@@ -137,14 +137,14 @@ with `--pad-quant-force` widening `ffn_gate_exps` and `ffn_up_exps` from 64 to 2
 ```
 
 That is a strong result and a narrow one. `--pad-quant-force` only applies to Q8_0, whose
-blocks are 32 elements, and 320 and 64 are both multiples of 32. Padding there appends whole
+blocks are 32 elements, and 320 and 64 are both multiples of 32. Shimming there appends whole
 untouched zero blocks, so bit-equality is close to algebraically guaranteed. It confirms the
 implementation does what it says; it cannot speak to k-quants.
 
 **The k-quant boundary superblock, which is the case that actually matters.** Nemotron's
-expert width is 1856 = 7×256 + 64. Padded to 2048 that is eight k-quant superblocks, and the
+expert width is 1856 = 7×256 + 64. Shimmed to 2048 that is eight k-quant superblocks, and the
 eighth holds 64 real weights beside 192 injected zeros, sharing one scale and minimum with
-them. If padding degrades anything, it degrades those 64 weights.
+them. If shimming degrades anything, it degrades those 64 weights.
 
 Measured by dequantizing the shipped tuned build and comparing against the BF16 parent,
 reconstruction error per superblock, `iq2_s`, ~11M real weights:
@@ -158,35 +158,35 @@ Ratio 0.976, and 0.981 on a second tensor from a different layer. The boundary s
 quantized **no worse** than a fully-real one, well inside the spread of the interior blocks
 themselves. This measures the file that actually shipped, not a synthetic fixture.
 
-One precision worth stating: after dequantization the padded columns are not exactly zero
+One precision worth stating: after dequantization the shimmed columns are not exactly zero
 (max 1.8e-3 against a weight RMS of 1.8e-2). That is harmless because `ggml_pad` zeroes the
 *activation* entering those columns, so they multiply by zero. The correctness rests on the
 activation side, not on the weights staying pristine.
 
 ## Limitations
 
-**The payoff scales with how close the width already is to a multiple of 256.** Padding costs
+**The payoff scales with how close the width already is to a multiple of 256.** Shimming costs
 you the zeros:
 
-| original width | padded to | overhead | verdict |
+| original width | shimmed to | overhead | verdict |
 |---:|---:|---:|---|
 | 1856 | 2048 | 9.4% | excellent — this is the Nemotron expert case above |
 | 640 | 768 | 16.7% | good |
 | 320 or 160 | 512 / 256 | 37.5% | marginal, you may pay more in zeros than you win in bits |
 
-**Embedding and lookup tables are deliberately never padded.** They are addressed by
+**Embedding and lookup tables are deliberately never shimmed.** They are addressed by
 `get_rows`, not matmul, and v1 is matmul-only. On models where an embedding table carries most
 of the forced mass this caps the benefit hard.
 
-**It does not always win.** On Qwen3.8-Flash-Next (177B, expert widths 640/320/160), padding
+**It does not always win.** On Qwen3.8-Flash-Next (177B, expert widths 640/320/160), shimming
 works mechanically — 572 expert tensors reached genuine `iq2_xxs`, which the stock quantizer
 cannot produce — but the result was *worse* than the existing published file: 65.3 GB at KLD
 0.548, against unsloth's UD-IQ1_S at 72.5 GB and 0.404. A more aggressive attempt was worse
 still (60.3 GB, 0.815). Two reasons: 29% of that model is a width-160 per-layer embedding
-table that padding won't touch, and the forced 4.5-bit floor on a third of its expert tensors
+table that shimming won't touch, and the forced 4.5-bit floor on a third of its expert tensors
 was partly *protecting* it. Removing a constraint is not the same as improving a model.
 
-**Files built with this patch only load with this patch.** A padded GGUF carries metadata and
+**Files built with this patch only load with this patch.** A shimmed GGUF carries metadata and
 tensor shapes that stock llama.cpp does not understand.
 
 **Tested on:** `nemotron_h_moe` (Nemotron-3.5-Lightning, Nemotron-3-Nano) and `qwen4exp`
@@ -208,7 +208,7 @@ it**. As of 2026-08-28 the patch also applies cleanly to upstream `master`
 (`50f068fff`), verified with `git apply --check`, so you can skip the `git checkout` if you
 prefer to be current — but then you are running a build I have not measured.
 
-Then quantize as usual. Padding engages automatically whenever a target type needs 256-blocks
+Then quantize as usual. Shimming engages automatically whenever a target type needs 256-blocks
 and the tensor width doesn't provide it; the log prints
 `PadQuant will widen <tensor> from N to M columns` for each one.
 
@@ -216,7 +216,7 @@ and the tensor width doesn't provide it; the log prints
 
 `tests/` contains the scaffolding used during development: toy dense and MoE model builders
 with deliberately non-divisible widths, a GGUF tensor-type inspector, and a helper for
-un-padding an imatrix so it can be reused across padded and unpadded builds.
+un-shimming an imatrix so it can be reused across shimmed and unshimmed builds.
 
 ## License
 
